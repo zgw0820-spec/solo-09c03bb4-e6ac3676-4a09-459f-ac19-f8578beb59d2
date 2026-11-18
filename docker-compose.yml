@@ -1,0 +1,49 @@
+services:
+  db:
+    image: postgres:16
+    container_name: faultlog-db
+    environment:
+      POSTGRES_DB: faultdb
+      POSTGRES_USER: ops
+      POSTGRES_PASSWORD: ops_password
+    volumes:
+      - ./db/init:/docker-entrypoint-initdb.d:ro   # 首次启动建表并预置故障日志
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ops -d faultdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"   # 暴露给宿主机，便于自测脚本直连重置数据
+
+  app1:
+    build: .
+    container_name: faultlog-app1
+    environment:
+      DATABASE_URL: postgresql://ops:ops_password@db:5432/faultdb
+      INSTANCE_ID: app1
+      ENABLE_TEST_HOOKS: "true"   # 演示删列失败路径；生产请关闭
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+
+  app2:
+    build: .
+    container_name: faultlog-app2
+    environment:
+      DATABASE_URL: postgresql://ops:ops_password@db:5432/faultdb
+      INSTANCE_ID: app2
+      ENABLE_TEST_HOOKS: "true"   # 演示删列失败路径；生产请关闭
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8002:8000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

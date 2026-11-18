@@ -1,0 +1,3 @@
+# 自测脚本专用依赖（应用镜像不需要）
+httpx==0.28.1
+pgserver==0.1.4  # 内嵌 PostgreSQL 16.2，用于无 Docker 环境的本地自测
