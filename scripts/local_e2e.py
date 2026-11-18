@@ -4,8 +4,8 @@
   1. 用 pgserver（pip 包内嵌 PostgreSQL 16）初始化并启动一个数据库；
   2. 应用 db/init/01_init.sql 预置故障日志；
   3. 启动两个 uvicorn 实例（127.0.0.1:8001 / :8002）共享该库；
-  4. 运行 scripts/e2e.py 的全部场景（含长查询交错、失败重试、并发退役）；
-  5. 运行“退役途中实例崩溃重启”场景（kill -9 后重启，验证状态保留与自动续跑）。
+  4. 运行 scripts/e2e.py 的全部场景（查询号唯一/取消/池满/长查询交错/失败重试/并发退役）；
+  5. 运行两个崩溃场景：退役途中 kill -9 续跑，以及在途查询崩溃后的 interrupted 对账。
 
 用法： python3 scripts/local_e2e.py
 """
@@ -84,14 +84,15 @@ class AppInstance:
 
 def scenario_restart_mid_retirement(app1: AppInstance, app2: AppInstance,
                                     dsn: str, ck: e2e.Check) -> None:
-    print("\n== 场景 4：退役途中实例崩溃重启 -> 状态保留、旧版不复单、自动续跑 ==")
+    print("\n== 场景 7：退役途中实例崩溃重启 -> 状态保留、旧版不复单、自动续跑 ==")
     e2e.reset_db(dsn)
     results: dict[str, httpx.Response] = {}
 
     # 在幸存实例 app2 上发起长旧版查询（退役期间它一直持有共享锁）
     t = threading.Thread(
         target=lambda: results.update(
-            slow=e2e.get(f"{APP2}/api/v1/legacy/fault-logs", params={"slow_ms": 9000})))
+            slow=e2e.get(f"{APP2}/api/v1/legacy/fault-logs",
+                         params={"slow_ms": 9000, "query_id": "restart-slow-0001"})))
     t.start()
     time.sleep(1.5)  # 确保慢查询已被接纳
 
@@ -105,14 +106,16 @@ def scenario_restart_mid_retirement(app1: AppInstance, app2: AppInstance,
     st = e2e.retirement_state(APP2)
     ck(st["status"] == "retiring", "app1 宕机后状态保留 retiring（未丢未误报）")
     ck(st["legacy_column_present"], "app1 宕机后旧列仍在（长查询未读完）")
-    r = e2e.get(f"{APP2}/api/v1/legacy/fault-logs")
+    r = e2e.get(f"{APP2}/api/v1/legacy/fault-logs",
+                params={"query_id": "restart-app2-rej1"})
     ck(r.status_code == 409, "app1 宕机后 app2 旧版仍拒单(409)", f"got {r.status_code}")
     r = e2e.get(f"{APP2}/api/v2/fault-logs")
     ck(r.status_code == 200, "app1 宕机后 app2 新版仍可用(200)")
 
     app1.start()  # 重启 app1：启动时应发现 retiring 并自动续跑退役任务
 
-    r = e2e.get(f"{APP1}/api/v1/legacy/fault-logs")
+    r = e2e.get(f"{APP1}/api/v1/legacy/fault-logs",
+                params={"query_id": "restart-app1-rej1"})
     ck(r.status_code == 409, "app1 重启后旧版仍拒单(409，不能重新接单)", f"got {r.status_code}")
 
     t.join(timeout=40)
@@ -127,10 +130,60 @@ def scenario_restart_mid_retirement(app1: AppInstance, app2: AppInstance,
     st = e2e.retirement_state(APP1)
     ck(not st["legacy_column_present"], "旧列最终已删除")
     for name, base in (("app1", APP1), ("app2", APP2)):
-        r = e2e.get(f"{base}/api/v1/legacy/fault-logs")
+        r = e2e.get(f"{base}/api/v1/legacy/fault-logs",
+                    params={"query_id": f"restart-{name}-gone1"})
         ck(r.status_code == 410, f"{name} 最终旧版 410", f"got {r.status_code}")
         r = e2e.get(f"{base}/api/v2/fault-logs")
         ck(r.status_code == 200, f"{name} 最终新版仍可用(200)")
+
+
+def scenario_crash_reconciliation(app1: AppInstance, app2: AppInstance,
+                                  dsn: str, ck: e2e.Check) -> None:
+    print("\n== 场景 8：属主实例崩溃 -> 在途查询重启后对账 interrupted（不虚报取消） ==")
+    e2e.reset_db(dsn)
+    results: dict[str, httpx.Response] = {}
+
+    t = threading.Thread(
+        target=lambda: results.update(
+            r=e2e.get(f"{APP1}/api/v1/legacy/fault-logs",
+                      params={"slow_ms": 60000, "query_id": "crash-recon-0001"})))
+    t.start()
+    snap = e2e._wait_query_state(APP1, "crash-recon-0001",
+                                 {"accepted", "cancel_requested"}, timeout=12)
+    ck(snap is not None and snap["instance_id"] == "app1",
+       "app1 名下在途慢查询已登记")
+
+    app1.kill()  # 属主带着在途查询崩溃，取消信号来不及确认
+    # 崩溃后、重启前：其他实例只能看到非终态，取消请求必须如实说“未确认”
+    r = e2e.post(f"{APP2}/api/v1/legacy/queries/crash-recon-0001/cancel")
+    ck(r.status_code == 200 and r.json()["cancelled"] is False
+       and r.json()["acknowledged"] is False
+       and r.json()["state"] == "cancel_requested",
+       "属主崩溃时取消：acknowledged=false 并附当前状态，不虚报成功",
+       f"got {r.text[:160]}")
+
+    app1.start()  # 重启触发启动对账
+    ok = e2e.wait_until(
+        lambda: e2e.get(f"{APP2}/api/v1/legacy/queries/crash-recon-0001")
+        .json().get("status") == "interrupted",
+        20, desc="status==interrupted")
+    ck(ok, "重启后在途登记对账为 interrupted 终态")
+
+    rc = e2e.post(f"{APP1}/api/v1/legacy/queries/crash-recon-0001/cancel")
+    ck(rc.status_code == 200 and rc.json()["cancelled"] is False
+       and rc.json()["state"] == "interrupted",
+       "对 interrupted 号取消：明确未取消、状态如实", f"got {rc.text[:160]}")
+    # 同号仍不可重新接纳（它确实被接纳过一次）
+    r = e2e.get(f"{APP1}/api/v1/legacy/fault-logs",
+                params={"query_id": "crash-recon-0001"})
+    ck(r.status_code == 409, "interrupted 旧号不能再次接纳(409)", f"got {r.status_code}")
+    # 实例恢复后新旧检索都正常，其他查询号不受影响
+    r = e2e.get(f"{APP1}/api/v1/legacy/fault-logs",
+                params={"query_id": "crash-recon-new-02"})
+    ck(r.status_code == 200 and r.json()["status"] == "completed",
+       "重启后新查询号正常完成(200)")
+    r = e2e.get(f"{APP2}/api/v2/fault-logs")
+    ck(r.status_code == 200 and r.json()["count"] > 0, "app2 新版检索始终可用")
 
 
 def main() -> int:
@@ -164,11 +217,14 @@ def main() -> int:
         app1.start()
         app2.start()
 
-        # 场景 1-3（每个非初始场景前自行重置数据库）
+        # 场景 1-6（e2e.py，每个非初始场景前自行重置数据库）
         e2e.run_scenarios(APP1, APP2, dsn, [], ck)
 
-        # 场景 4：崩溃重启
+        # 场景 7：退役途中崩溃重启（状态机）
         scenario_restart_mid_retirement(app1, app2, dsn, ck)
+
+        # 场景 8：崩溃在途查询的 interrupted 对账（active 状态，重置后再做）
+        scenario_crash_reconciliation(app1, app2, dsn, ck)
     finally:
         app1.stop()
         app2.stop()

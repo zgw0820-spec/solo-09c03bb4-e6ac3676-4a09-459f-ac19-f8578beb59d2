@@ -1,6 +1,7 @@
 -- 故障日志库初始化脚本。
 -- Docker 首次启动时由 /docker-entrypoint-initdb.d 执行；本地自测也会重复执行，
 -- 因此写成可重入（先 DROP 再 CREATE）。
+DROP TABLE IF EXISTS legacy_queries CASCADE;
 DROP TABLE IF EXISTS fault_logs CASCADE;
 DROP TABLE IF EXISTS retirement_state CASCADE;
 
@@ -73,3 +74,22 @@ CREATE TABLE retirement_state (
 );
 
 INSERT INTO retirement_state (id, status) VALUES (1, 'active');
+
+-- 旧版检索查询号登记表（两实例共享）：主键保证同号全局只能接纳一次。
+-- 生命周期由应用维护：接纳时 INSERT，取消/完成时 UPDATE 终态，
+-- 退役锁内拒单时 DELETE（未真正执行，不留号）。
+CREATE TABLE legacy_queries (
+    query_id     text PRIMARY KEY
+                 CHECK (char_length(query_id) BETWEEN 8 AND 128),
+    instance_id  text NOT NULL,              -- 接纳并执行该查询的实例
+    backend_pid  integer NOT NULL,           -- 执行后端进程号（pg_cancel_backend 用）
+    status       text NOT NULL DEFAULT 'accepted'
+                 CHECK (status IN ('accepted', 'cancel_requested',
+                                   'cancelled', 'completed', 'failed',
+                                   'interrupted')),
+    accepted_at  timestamptz NOT NULL DEFAULT now(),
+    finished_at  timestamptz
+);
+
+-- 取消轮询/按属主实例排查时的常用索引（表本身很小，主要保证计划稳定）。
+CREATE INDEX idx_legacy_queries_status ON legacy_queries (status);
